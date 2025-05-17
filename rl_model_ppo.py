@@ -1,74 +1,112 @@
+"""
+Script to train a PPO agent on a Kubernetes environment.
+"""
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.distributions import Categorical
 
-# Define our policy network
 from kubernetes_environment_rl import K8SEnv
 
 
 class PolicyNetwork(nn.Module):
-    def __init__(self, n_inputs, n_actions):
-        super(PolicyNetwork, self).__init__()
-        # Define the network layers
+    """
+    Policy network mapping states to action probabilities.
+    """
+
+    def __init__(self, n_inputs: int, n_actions: int) -> None:
+        super().__init__()
         self.network = nn.Sequential(
             nn.Linear(n_inputs, 128),
             nn.ReLU(),
             nn.Linear(128, 64),
             nn.ReLU(),
             nn.Linear(64, n_actions),
-            nn.Softmax(dim=-1)
+            nn.Softmax(dim=-1),
         )
 
-    def forward(self, state):
+    def forward(self, state: torch.Tensor) -> torch.Tensor:
         return self.network(state)
 
 
-# Define the PPO algorithm
 class PPO:
-    def __init__(self, n_inputs, n_actions, gamma=0.99, lr=0.01, clip_epsilon=0.2):
+    """
+    Proximal Policy Optimization algorithm.
+    """
+
+    def __init__(
+        self,
+        n_inputs: int,
+        n_actions: int,
+        gamma: float = 0.99,
+        lr: float = 1e-2,
+        clip_epsilon: float = 0.2,
+    ) -> None:
         self.policy = PolicyNetwork(n_inputs, n_actions)
         self.optimizer = optim.Adam(self.policy.parameters(), lr=lr)
         self.gamma = gamma
         self.clip_epsilon = clip_epsilon
 
-    def get_action(self, state):
-        state = torch.tensor(state, dtype=torch.float32).view(1, -1)  # Reshape the state
-        action_probs = self.policy(state)
-        action_distribution = Categorical(action_probs)
-        action = action_distribution.sample()
-        return action.item(), action_distribution.log_prob(action)
+    def get_action(self, state) -> tuple[int, torch.Tensor]:
+        """
+        Sample an action and its log probability from the policy.
+        """
+        state_t = torch.tensor(state, dtype=torch.float32).unsqueeze(0)
+        probs = self.policy(state_t)
+        dist = Categorical(probs)
+        action = dist.sample()
+        return action.item(), dist.log_prob(action)
 
-    def update(self, states, actions, log_probs, returns):
-        states = torch.tensor(states, dtype=torch.float32)
-        actions = torch.tensor(actions, dtype=torch.int32)
-        log_probs = torch.tensor(log_probs, dtype=torch.float32)
-        returns = torch.tensor(returns, dtype=torch.float32)
+    def update(
+        self,
+        states: list,
+        actions: list,
+        old_log_probs: list,
+        returns: torch.Tensor,
+    ) -> None:
+        """
+        Perform PPO update given trajectories and returns.
+        """
+        states_t = torch.tensor(states, dtype=torch.float32)
+        actions_t = torch.tensor(actions, dtype=torch.int64)
+        old_lp_t = torch.tensor(old_log_probs, dtype=torch.float32)
 
-        action_probs = self.policy(states[:, -1, :])  # Only consider the last state in each sequence
-        action_distribution = Categorical(action_probs)
-        new_log_probs = action_distribution.log_prob(actions)
+        # Compute new log probabilities
+        probs = self.policy(states_t[:, -1, :])
+        dist = Categorical(probs)
+        new_lp_t = dist.log_prob(actions_t)
 
-        ratio = (new_log_probs - log_probs).exp()
+        # Probability ratio for clipping
+        ratio = (new_lp_t - old_lp_t).exp()
+        obj = ratio * returns
+        clipped = torch.clamp(
+            ratio,
+            1.0 - self.clip_epsilon,
+            1.0 + self.clip_epsilon,
+        ) * returns
 
-        surrogate_objective = ratio * returns
-        clipped_surrogate_objective = torch.clamp(ratio, 1.0 - self.clip_epsilon, 1.0 + self.clip_epsilon) * returns
-
-        loss = -torch.min(surrogate_objective, clipped_surrogate_objective).mean()
+        loss = -torch.min(obj, clipped).mean()
 
         self.optimizer.zero_grad()
         loss.backward()
         self.optimizer.step()
 
 
-def train_ppo(env, ppo, episodes):
-    for episode in range(episodes):
+def train_ppo(
+    env: K8SEnv,
+    agent: PPO,
+    episodes: int,
+) -> None:
+    """
+    Train PPO agent for a given number of episodes.
+    """
+    for ep in range(1, episodes + 1):
         states, actions, log_probs, rewards = [], [], [], []
         state = env.reset()
 
-        for t in range(100):  # T_MAX is the maximum number of steps in an episode
-            action, log_prob = ppo.get_action(state)
-
+        for _ in range(100):
+            action, log_prob = agent.get_action(state)
             new_state, reward, done, _ = env.step(action)
 
             states.append(state)
@@ -76,32 +114,37 @@ def train_ppo(env, ppo, episodes):
             log_probs.append(log_prob.item())
             rewards.append(reward)
 
+            state = new_state
             if done:
                 break
 
-            state = new_state
-
+        # Compute discounted returns
         returns = []
-        Gt = 0
-        pw = 0
+        G = 0.0
+        for r in reversed(rewards):
+            G = r + agent.gamma * G
+            returns.insert(0, G)
 
-        for reward in reversed(rewards):
-            Gt += ppo.gamma ** pw * reward
-            pw += 1
-            returns.insert(0, Gt)
+        returns_t = torch.tensor(returns, dtype=torch.float32)
+        returns_t = (returns_t - returns_t.mean()) / (returns_t.std() + 1e-9)
 
-        returns = torch.tensor(returns)
-        returns = (returns - returns.mean()) / (returns.std() + 1e-9)  # normalize returns
-
-        ppo.update(states, actions, log_probs, returns)
+        agent.update(states, actions, log_probs, returns_t)
+        print(f"Episode {ep}, Total Reward: {sum(rewards)}")
 
 
-# Run the training
-N_INPUTS = 24  # Number of inputs to the policy network. Change this according to your state representation
-N_ACTIONS = 8  # Number of possible actions. Change this according to your action space
-EPISODES = 500  # Number of episodes to train for
-NAMESPACE = 'default'  # Kubernetes namespace
+def main() -> None:
+    """
+    Entry point for PPO training.
+    """
+    n_inputs = 24
+    n_actions = 8
+    episodes = 500
+    namespace = 'default'
 
-env = K8SEnv(NAMESPACE)
-ppo = PPO(N_INPUTS, N_ACTIONS)
-train_ppo(env, ppo, EPISODES)
+    env = K8SEnv(namespace)
+    agent = PPO(n_inputs, n_actions)
+    train_ppo(env, agent, episodes)
+
+
+if __name__ == '__main__':
+    main()

@@ -1,88 +1,124 @@
+"""
+Script to train an Actor-Critic (PPO-style) agent on a Kubernetes environment.
+"""
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.distributions import Categorical
 
-# Define our policy network
 from kubernetes_environment_rl import K8SEnv
 
 
 class ActorNetwork(nn.Module):
+    """
+    Policy (actor) network mapping states to action probabilities.
+    """
+
     def __init__(self, n_inputs, n_actions):
-        super(ActorNetwork, self).__init__()
+        super().__init__()
         self.network = nn.Sequential(
             nn.Linear(n_inputs, 128),
             nn.ReLU(),
             nn.Linear(128, 64),
             nn.ReLU(),
             nn.Linear(64, n_actions),
-            nn.Softmax(dim=-1)
+            nn.Softmax(dim=-1),
         )
 
     def forward(self, state):
         return self.network(state)
 
-# Define the Critic Network
+
 class CriticNetwork(nn.Module):
+    """
+    Value (critic) network mapping states to state-value estimates.
+    """
+
     def __init__(self, n_inputs):
-        super(CriticNetwork, self).__init__()
+        super().__init__()
         self.network = nn.Sequential(
             nn.Linear(n_inputs, 128),
             nn.ReLU(),
             nn.Linear(128, 64),
             nn.ReLU(),
-            nn.Linear(64, 1)
+            nn.Linear(64, 1),
         )
 
     def forward(self, state):
         return self.network(state)
 
 
-# Define the PPO algorithm
 class ActorCritic:
-    def __init__(self, n_inputs, n_actions, gamma=0.99, actor_lr=0.01, critic_lr=0.01):
+    """
+    Actor-Critic algorithm combining policy gradient and value-based updates.
+    """
+
+    def __init__(
+        self,
+        n_inputs,
+        n_actions,
+        gamma=0.99,
+        actor_lr=1e-2,
+        critic_lr=1e-2,
+    ):
         self.actor = ActorNetwork(n_inputs, n_actions)
         self.critic = CriticNetwork(n_inputs)
         self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=actor_lr)
-        self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=critic_lr)
+        self.critic_optimizer = optim.Adam(
+            self.critic.parameters(), lr=critic_lr
+        )
         self.gamma = gamma
-        self.n_actions = n_actions
 
     def get_action(self, state):
-        state = torch.tensor(state, dtype=torch.float32).view(1, -1)  # Reshape the state
+        """
+        Sample an action from the policy given a state.
+
+        Returns:
+            action (int): chosen action index
+            log_prob (Tensor): log probability of the action
+        """
+        state_tensor = torch.tensor(state, dtype=torch.float32).unsqueeze(0)
         with torch.no_grad():
-            action_probs = self.actor(state)
-        action_distribution = Categorical(action_probs)
-        action = action_distribution.sample()
-        return action.item(), action_distribution.log_prob(action)
+            probs = self.actor(state_tensor)
+        dist = Categorical(probs)
+        action = dist.sample()
+        return action.item(), dist.log_prob(action)
 
-    def update(self, state, action, reward, next_state, done):
-        state = torch.tensor(state, dtype=torch.float32).view(1, -1)
-        next_state = torch.tensor(next_state, dtype=torch.float32).view(1, -1)
-        reward = torch.tensor(reward, dtype=torch.float32)
-        action = torch.tensor(action, dtype=torch.int64)
+    def update(
+        self,
+        state,
+        action,
+        reward,
+        next_state,
+        done,
+    ):
+        """
+        Update actor and critic networks based on a single transition.
+        """
+        state_t = torch.tensor(state, dtype=torch.float32).unsqueeze(0)
+        next_t = torch.tensor(next_state, dtype=torch.float32).unsqueeze(0)
+        reward_t = torch.tensor(reward, dtype=torch.float32)
+        action_t = torch.tensor(action, dtype=torch.int64)
 
-        # Get predicted value for current state and next state
-        current_value = self.critic(state)
+        # Critic estimates
+        current_value = self.critic(state_t)
         with torch.no_grad():
-            next_value = self.critic(next_state)
+            next_value = self.critic(next_t)
 
-        # Compute the target value
-        target_value = reward + (1 - done) * self.gamma * next_value
+        target = reward_t + (1 - done) * self.gamma * next_value
+        advantage = target - current_value
 
-        # Compute advantage
-        advantage = target_value - current_value
-
-        # Critic loss (Mean Squared Error)
+        # Critic loss (MSE)
         critic_loss = advantage.pow(2).mean()
 
-        # Compute actor loss
-        action_probs = self.actor(state)
-        action_distribution = Categorical(action_probs)
-        log_prob = action_distribution.log_prob(action)
+        # Actor loss (policy gradient)
+        probs = self.actor(state_t)
+        dist = Categorical(probs)
+        log_prob = dist.log_prob(action_t)
         actor_loss = -(log_prob * advantage.detach()).mean()
 
-        # Update the actor and critic networks
+        # Backpropagate losses
         self.actor_optimizer.zero_grad()
         actor_loss.backward()
         self.actor_optimizer.step()
@@ -91,35 +127,47 @@ class ActorCritic:
         critic_loss.backward()
         self.critic_optimizer.step()
 
-    def train(self, env, episodes):
-        for episode in range(episodes):
+    def train(self, env, episodes, max_steps=100):
+        """
+        Run training loop over specified episodes.
+        """
+        for ep in range(1, episodes + 1):
             state = env.reset()
-            total_reward = 0
+            total_reward = 0.0
 
-            for t in range(100):  # T_MAX is the maximum number of steps in an episode
+            for _ in range(max_steps):
                 action, _ = self.get_action(state)
                 next_state, reward, done, _ = env.step(action)
-
-                # Update the networks
                 self.update(state, action, reward, next_state, done)
 
                 total_reward += reward
+                state = next_state
 
                 if done:
                     break
 
-                state = next_state
-
-            print(f"Episode {episode + 1}, Total Reward: {total_reward}")
+            print(f"Episode {ep}, Total Reward: {total_reward}")
 
         return self
 
-# Run the training
-N_INPUTS = 24  # Number of inputs to the policy network. Change this according to your state representation
-N_ACTIONS = 8  # Number of possible actions. Change this according to your action space
-EPISODES = 500  # Number of episodes to train for
-NAMESPACE = 'default'  # Kubernetes namespace
 
-env = K8SEnv(NAMESPACE)
-a2c = ActorCritic(N_INPUTS, N_ACTIONS)
-a2c.train(env, EPISODES)
+def main():
+    """
+    Entry point for training the Actor-Critic agent.
+    """
+    # Configuration
+    n_inputs = 24
+    n_actions = 8
+    episodes = 500
+    namespace = "default"
+
+    # Initialize environment and agent
+    env = K8SEnv(namespace)
+    agent = ActorCritic(n_inputs, n_actions)
+
+    # Start training
+    agent.train(env, episodes)
+
+
+if __name__ == "__main__":
+    main()
