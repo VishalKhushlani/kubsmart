@@ -1,0 +1,27 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: intensive-task-app
+spec:
+  replicas: 4
+  selector:
+    matchLabels:
+      app: intensive-task-app
+  template:
+    metadata:
+      labels:
+        app: intensive-task-app
+    spec:
+      containers:
+      - image: intensive-task-app:latest
+        imagePullPolicy: IfNotPresent
+        name: intensive-task-app
+        ports:
+        - containerPort: 3000
+        resources:
+          limits:
+            cpu: 189m
+            memory: 993Mi
+          requests:
+            cpu: 93m
+            memory: 463Mi
